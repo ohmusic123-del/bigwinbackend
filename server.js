@@ -6,7 +6,9 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const bcrypt = require('bcryptjs');
 const { Cashfree } = require("cashfree-pg");
-
+   const Tournament = require("./models/Tournament");
+   const TournamentParticipant = require("./models/TournamentParticipant");
+   const TournamentMatch = require("./models/TournamentMatch");
 
 const app = express();
 
@@ -2669,7 +2671,618 @@ app.delete("/giftcode/:code", auth, async (req, res) => {
     res.status(500).json({ error: "Failed to delete gift code" });
   }
 });
+/* ============================================================
+   TOURNAMENT SYSTEM API ROUTES
+   Add these routes to your server.js file
+   
+   Make sure to also add at the top of server.js:
+   const Tournament = require("./models/Tournament");
+   const TournamentParticipant = require("./models/TournamentParticipant");
+   const TournamentMatch = require("./models/TournamentMatch");
+============================================================ */
 
+// ============================================
+// PUBLIC TOURNAMENT ROUTES
+// ============================================
+
+// Get all active tournaments (for home page)
+app.get('/tournaments', async (req, res) => {
+    try {
+        const { status, game, featured } = req.query;
+        const query = {};
+        
+        if (status) query.status = status;
+        if (game) query.game = game;
+        if (featured === 'true') query.featured = true;
+        
+        const tournaments = await Tournament.find(query)
+            .sort({ featured: -1, startTime: 1 })
+            .select('-adminNotes -roomPassword');
+        
+        res.json({ tournaments });
+    } catch (err) {
+        console.error('Error fetching tournaments:', err);
+        res.status(500).json({ error: 'Failed to fetch tournaments' });
+    }
+});
+
+// Get single tournament details
+app.get('/tournaments/:id', async (req, res) => {
+    try {
+        const tournament = await Tournament.findById(req.params.id)
+            .select('-adminNotes -roomPassword');
+        
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        // Get participant count
+        const participantCount = await TournamentParticipant.countDocuments({
+            tournamentId: tournament._id,
+            status: { $ne: 'disqualified' }
+        });
+        
+        tournament.currentParticipants = participantCount;
+        
+        res.json({ tournament });
+    } catch (err) {
+        console.error('Error fetching tournament:', err);
+        res.status(500).json({ error: 'Failed to fetch tournament' });
+    }
+});
+
+// Get tournament participants/leaderboard
+app.get('/tournaments/:id/participants', async (req, res) => {
+    try {
+        const participants = await TournamentParticipant.find({
+            tournamentId: req.params.id,
+            status: { $ne: 'disqualified' }
+        })
+        .populate('userId', 'mobile referralCode')
+        .sort({ finalPosition: 1, points: -1, kills: -1 })
+        .select('-resultScreenshot -notes');
+        
+        res.json({ participants });
+    } catch (err) {
+        console.error('Error fetching participants:', err);
+        res.status(500).json({ error: 'Failed to fetch participants' });
+    }
+});
+
+// ============================================
+// USER TOURNAMENT ROUTES (Authenticated)
+// ============================================
+
+// Register for tournament
+app.post('/tournaments/:id/register', auth, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const tournamentId = req.params.id;
+        const { teamName, inGameName, inGameId, teamMembers, useBonus } = req.body;
+        
+        // Validate input
+        if (!teamName || !inGameName || !inGameId) {
+            return res.status(400).json({ error: 'Team name, in-game name, and in-game ID are required' });
+        }
+        
+        // Get tournament
+        const tournament = await Tournament.findById(tournamentId);
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        // Check if registration is open
+        if (!tournament.isRegistrationOpen()) {
+            return res.status(400).json({ error: 'Tournament registration is closed' });
+        }
+        
+        // Check user's existing registrations
+        const userRegistrations = await TournamentParticipant.countDocuments({
+            tournamentId,
+            userId,
+            status: { $ne: 'disqualified' }
+        });
+        
+        if (!tournament.canUserRegister(userRegistrations)) {
+            return res.status(400).json({ 
+                error: `You can only register ${tournament.maxParticipantsPerUser} time(s) for this tournament` 
+            });
+        }
+        
+        // Get user
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        if (user.banned) {
+            return res.status(403).json({ error: 'Your account is banned' });
+        }
+        
+        // Check balance
+        const balance = useBonus ? user.bonus : user.wallet;
+        if (balance < tournament.entryFee) {
+            return res.status(400).json({ 
+                error: `Insufficient ${useBonus ? 'bonus' : 'wallet'} balance. Required: ₹${tournament.entryFee}` 
+            });
+        }
+        
+        // Get next slot number
+        const maxSlot = await TournamentParticipant.findOne({ tournamentId })
+            .sort({ slotNumber: -1 })
+            .select('slotNumber');
+        const slotNumber = maxSlot ? maxSlot.slotNumber + 1 : 1;
+        
+        // Create participant
+        const participant = new TournamentParticipant({
+            tournamentId,
+            userId,
+            teamName,
+            inGameName,
+            inGameId,
+            teamMembers: teamMembers || [],
+            entryFeePaid: tournament.entryFee,
+            paidFrom: useBonus ? 'bonus' : 'wallet',
+            slotNumber,
+            status: 'registered'
+        });
+        
+        await participant.save();
+        
+        // Deduct entry fee
+        if (useBonus) {
+            user.updateBonus(-tournament.entryFee);
+        } else {
+            user.updateWallet(-tournament.entryFee);
+        }
+        await user.save();
+        
+        // Update tournament
+        tournament.currentParticipants += 1;
+        tournament.totalRevenue += tournament.entryFee;
+        
+        if (tournament.currentParticipants >= tournament.totalSlots) {
+            tournament.status = 'registration_closed';
+        }
+        
+        await tournament.save();
+        
+        res.json({ 
+            success: true, 
+            message: 'Successfully registered for tournament',
+            participant,
+            slotNumber,
+            balance: useBonus ? user.bonus : user.wallet
+        });
+        
+    } catch (err) {
+        console.error('Error registering for tournament:', err);
+        
+        if (err.code === 11000) {
+            return res.status(400).json({ error: 'You are already registered with this team name' });
+        }
+        
+        res.status(500).json({ error: 'Failed to register for tournament' });
+    }
+});
+
+// Get user's tournament registrations
+app.get('/my-tournaments', auth, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const { status } = req.query;
+        
+        const query = { userId };
+        if (status) query.status = status;
+        
+        const participants = await TournamentParticipant.find(query)
+            .populate('tournamentId')
+            .sort({ createdAt: -1 });
+        
+        res.json({ registrations: participants });
+    } catch (err) {
+        console.error('Error fetching user tournaments:', err);
+        res.status(500).json({ error: 'Failed to fetch tournaments' });
+    }
+});
+
+// Check-in for tournament
+app.post('/tournaments/:id/checkin', auth, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const tournamentId = req.params.id;
+        
+        const participant = await TournamentParticipant.findOne({
+            tournamentId,
+            userId,
+            status: 'registered'
+        });
+        
+        if (!participant) {
+            return res.status(404).json({ error: 'Registration not found' });
+        }
+        
+        const tournament = await Tournament.findById(tournamentId);
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        // Check if check-in time is valid (e.g., within 30 mins of start)
+        const now = new Date();
+        const timeDiff = tournament.startTime - now;
+        const minutesDiff = timeDiff / (1000 * 60);
+        
+        if (minutesDiff > 30 || minutesDiff < -5) {
+            return res.status(400).json({ 
+                error: 'Check-in is only available 30 minutes before tournament start' 
+            });
+        }
+        
+        participant.checkedIn = true;
+        participant.checkedInAt = new Date();
+        participant.status = 'checked_in';
+        await participant.save();
+        
+        res.json({ 
+            success: true, 
+            message: 'Successfully checked in',
+            roomId: tournament.roomId,
+            roomPassword: tournament.roomPassword
+        });
+        
+    } catch (err) {
+        console.error('Error checking in:', err);
+        res.status(500).json({ error: 'Failed to check in' });
+    }
+});
+
+// ============================================
+// ADMIN TOURNAMENT ROUTES
+// ============================================
+
+// Create tournament
+app.post('/admin/tournaments', adminAuth, async (req, res) => {
+    try {
+        const tournamentData = req.body;
+        
+        // Validate required fields
+        const required = ['title', 'game', 'description', 'type', 'totalSlots', 
+                         'entryFee', 'prizePool', 'startTime', 'endTime', 'registrationDeadline'];
+        
+        for (const field of required) {
+            if (!tournamentData[field]) {
+                return res.status(400).json({ error: `${field} is required` });
+            }
+        }
+        
+        // Validate dates
+        const start = new Date(tournamentData.startTime);
+        const end = new Date(tournamentData.endTime);
+        const regDeadline = new Date(tournamentData.registrationDeadline);
+        
+        if (regDeadline >= start) {
+            return res.status(400).json({ error: 'Registration deadline must be before start time' });
+        }
+        
+        if (start >= end) {
+            return res.status(400).json({ error: 'End time must be after start time' });
+        }
+        
+        const tournament = new Tournament({
+            ...tournamentData,
+            createdBy: 'admin',
+            status: 'registration_open'
+        });
+        
+        await tournament.save();
+        
+        res.json({ 
+            success: true, 
+            message: 'Tournament created successfully',
+            tournament 
+        });
+        
+    } catch (err) {
+        console.error('Error creating tournament:', err);
+        res.status(500).json({ error: 'Failed to create tournament' });
+    }
+});
+
+// Update tournament
+app.put('/admin/tournaments/:id', adminAuth, async (req, res) => {
+    try {
+        const tournament = await Tournament.findByIdAndUpdate(
+            req.params.id,
+            { $set: req.body },
+            { new: true, runValidators: true }
+        );
+        
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Tournament updated successfully',
+            tournament 
+        });
+        
+    } catch (err) {
+        console.error('Error updating tournament:', err);
+        res.status(500).json({ error: 'Failed to update tournament' });
+    }
+});
+
+// Delete tournament
+app.delete('/admin/tournaments/:id', adminAuth, async (req, res) => {
+    try {
+        const tournament = await Tournament.findById(req.params.id);
+        
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        // Check if tournament has participants
+        const participantCount = await TournamentParticipant.countDocuments({
+            tournamentId: req.params.id
+        });
+        
+        if (participantCount > 0 && tournament.status !== 'cancelled') {
+            return res.status(400).json({ 
+                error: 'Cannot delete tournament with participants. Cancel it instead.' 
+            });
+        }
+        
+        await Tournament.findByIdAndDelete(req.params.id);
+        await TournamentParticipant.deleteMany({ tournamentId: req.params.id });
+        await TournamentMatch.deleteMany({ tournamentId: req.params.id });
+        
+        res.json({ 
+            success: true, 
+            message: 'Tournament deleted successfully' 
+        });
+        
+    } catch (err) {
+        console.error('Error deleting tournament:', err);
+        res.status(500).json({ error: 'Failed to delete tournament' });
+    }
+});
+
+// Get all tournaments for admin
+app.get('/admin/tournaments', adminAuth, async (req, res) => {
+    try {
+        const { status, game } = req.query;
+        const query = {};
+        
+        if (status) query.status = status;
+        if (game) query.game = game;
+        
+        const tournaments = await Tournament.find(query)
+            .sort({ createdAt: -1 });
+        
+        // Get participant counts
+        for (let tournament of tournaments) {
+            const count = await TournamentParticipant.countDocuments({
+                tournamentId: tournament._id,
+                status: { $ne: 'disqualified' }
+            });
+            tournament.currentParticipants = count;
+        }
+        
+        res.json({ tournaments });
+    } catch (err) {
+        console.error('Error fetching admin tournaments:', err);
+        res.status(500).json({ error: 'Failed to fetch tournaments' });
+    }
+});
+
+// Get tournament participants for admin
+app.get('/admin/tournaments/:id/participants', adminAuth, async (req, res) => {
+    try {
+        const participants = await TournamentParticipant.find({
+            tournamentId: req.params.id
+        })
+        .populate('userId', 'mobile referralCode wallet bonus')
+        .sort({ slotNumber: 1 });
+        
+        res.json({ participants });
+    } catch (err) {
+        console.error('Error fetching participants:', err);
+        res.status(500).json({ error: 'Failed to fetch participants' });
+    }
+});
+
+// Update participant status
+app.put('/admin/participants/:id', adminAuth, async (req, res) => {
+    try {
+        const { status, kills, placement, points, finalPosition, prizeWon } = req.body;
+        
+        const participant = await TournamentParticipant.findById(req.params.id);
+        if (!participant) {
+            return res.status(404).json({ error: 'Participant not found' });
+        }
+        
+        if (status) participant.status = status;
+        if (kills !== undefined) participant.kills = kills;
+        if (placement !== undefined) participant.placement = placement;
+        if (points !== undefined) participant.points = points;
+        if (finalPosition !== undefined) participant.finalPosition = finalPosition;
+        if (prizeWon !== undefined) participant.prizeWon = prizeWon;
+        
+        await participant.save();
+        
+        res.json({ 
+            success: true, 
+            message: 'Participant updated successfully',
+            participant 
+        });
+        
+    } catch (err) {
+        console.error('Error updating participant:', err);
+        res.status(500).json({ error: 'Failed to update participant' });
+    }
+});
+
+// Publish tournament results
+app.post('/admin/tournaments/:id/publish-results', adminAuth, async (req, res) => {
+    try {
+        const tournamentId = req.params.id;
+        const { winners } = req.body; // Array of { participantId, position, prize }
+        
+        const tournament = await Tournament.findById(tournamentId);
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        if (tournament.resultsPublished) {
+            return res.status(400).json({ error: 'Results already published' });
+        }
+        
+        // Update winners
+        const winnerData = [];
+        
+        for (const winner of winners) {
+            const participant = await TournamentParticipant.findById(winner.participantId)
+                .populate('userId');
+            
+            if (!participant) continue;
+            
+            // Update participant
+            participant.finalPosition = winner.position;
+            participant.prizeWon = winner.prize;
+            participant.status = 'completed';
+            await participant.save();
+            
+            // Credit prize to user
+            if (winner.prize > 0) {
+                const user = participant.userId;
+                user.updateWallet(winner.prize);
+                await user.save();
+                
+                participant.prizeClaimed = true;
+                participant.prizeClaimedAt = new Date();
+                await participant.save();
+            }
+            
+            winnerData.push({
+                userId: participant.userId._id,
+                participantId: participant._id,
+                position: winner.position,
+                prize: winner.prize,
+                teamName: participant.teamName,
+                kills: participant.kills
+            });
+        }
+        
+        // Update tournament
+        tournament.winners = winnerData;
+        tournament.resultsPublished = true;
+        tournament.status = 'completed';
+        await tournament.save();
+        
+        res.json({ 
+            success: true, 
+            message: 'Results published and prizes distributed',
+            tournament 
+        });
+        
+    } catch (err) {
+        console.error('Error publishing results:', err);
+        res.status(500).json({ error: 'Failed to publish results' });
+    }
+});
+
+// Cancel tournament and refund participants
+app.post('/admin/tournaments/:id/cancel', adminAuth, async (req, res) => {
+    try {
+        const tournamentId = req.params.id;
+        const { reason } = req.body;
+        
+        const tournament = await Tournament.findById(tournamentId);
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        if (tournament.status === 'completed' || tournament.status === 'cancelled') {
+            return res.status(400).json({ error: 'Cannot cancel this tournament' });
+        }
+        
+        // Get all participants
+        const participants = await TournamentParticipant.find({
+            tournamentId,
+            status: { $nin: ['disqualified', 'completed'] }
+        }).populate('userId');
+        
+        // Refund all participants
+        for (const participant of participants) {
+            const user = participant.userId;
+            
+            if (participant.paidFrom === 'bonus') {
+                user.updateBonus(participant.entryFeePaid);
+            } else {
+                user.updateWallet(participant.entryFeePaid);
+            }
+            
+            await user.save();
+            
+            participant.status = 'disqualified';
+            participant.notes = `Tournament cancelled: ${reason || 'No reason provided'}`;
+            await participant.save();
+        }
+        
+        // Update tournament
+        tournament.status = 'cancelled';
+        tournament.adminNotes = reason || 'Cancelled by admin';
+        await tournament.save();
+        
+        res.json({ 
+            success: true, 
+            message: `Tournament cancelled and ${participants.length} participants refunded`,
+            refundedCount: participants.length
+        });
+        
+    } catch (err) {
+        console.error('Error cancelling tournament:', err);
+        res.status(500).json({ error: 'Failed to cancel tournament' });
+    }
+});
+
+// Get tournament statistics
+app.get('/admin/tournaments/:id/stats', adminAuth, async (req, res) => {
+    try {
+        const tournamentId = req.params.id;
+        
+        const tournament = await Tournament.findById(tournamentId);
+        if (!tournament) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        const participants = await TournamentParticipant.find({ tournamentId });
+        
+        const stats = {
+            totalParticipants: participants.length,
+            registered: participants.filter(p => p.status === 'registered').length,
+            checkedIn: participants.filter(p => p.checkedIn).length,
+            completed: participants.filter(p => p.status === 'completed').length,
+            disqualified: participants.filter(p => p.status === 'disqualified').length,
+            totalRevenue: tournament.totalRevenue,
+            prizePool: tournament.prizePool,
+            profit: tournament.totalRevenue - tournament.prizePool,
+            slotsRemaining: tournament.totalSlots - participants.length,
+            walletPayments: participants.filter(p => p.paidFrom === 'wallet').length,
+            bonusPayments: participants.filter(p => p.paidFrom === 'bonus').length
+        };
+        
+        res.json({ stats });
+    } catch (err) {
+        console.error('Error fetching tournament stats:', err);
+        res.status(500).json({ error: 'Failed to fetch stats' });
+    }
+});
+
+/* ============================================================
+   END OF TOURNAMENT ROUTES
+============================================================ */
 /* =========================
 SERVER START
 ========================= */
