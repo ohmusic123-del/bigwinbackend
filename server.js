@@ -2672,6 +2672,183 @@ app.delete("/giftcode/:code", auth, async (req, res) => {
   }
 });
 /* ============================================================
+   DEPOSIT & WITHDRAWAL APPROVAL ROUTES
+   Add these routes to your server.js file (after existing admin routes)
+============================================================ */
+
+// ============================================
+// ADMIN DEPOSIT APPROVAL ROUTES
+// ============================================
+
+// Approve Deposit
+app.post('/admin/deposits/:id/approve', adminAuth, async (req, res) => {
+    try {
+        const deposit = await Deposit.findById(req.params.id).populate('userId');
+        
+        if (!deposit) {
+            return res.status(404).json({ error: 'Deposit not found' });
+        }
+        
+        if (deposit.status !== 'pending') {
+            return res.status(400).json({ error: 'Deposit already processed' });
+        }
+        
+        // Update user wallet
+        const user = await User.findById(deposit.userId);
+        user.updateWallet(deposit.amount);
+        user.deposited = true;
+        user.depositAmount += deposit.amount;
+        await user.save();
+        
+        // Update deposit status
+        deposit.status = 'completed';
+        deposit.processedAt = new Date();
+        await deposit.save();
+        
+        console.log(`Deposit ${deposit._id} approved for user ${user.mobile}, amount: ₹${deposit.amount}`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Deposit approved and wallet credited',
+            newBalance: user.wallet
+        });
+    } catch (err) {
+        console.error('Error approving deposit:', err);
+        res.status(500).json({ error: 'Failed to approve deposit' });
+    }
+});
+
+// Reject Deposit
+app.post('/admin/deposits/:id/reject', adminAuth, async (req, res) => {
+    try {
+        const { reason } = req.body;
+        const deposit = await Deposit.findById(req.params.id);
+        
+        if (!deposit) {
+            return res.status(404).json({ error: 'Deposit not found' });
+        }
+        
+        if (deposit.status !== 'pending') {
+            return res.status(400).json({ error: 'Deposit already processed' });
+        }
+        
+        // Update deposit status
+        deposit.status = 'failed';
+        deposit.failureReason = reason || 'Rejected by admin';
+        deposit.processedAt = new Date();
+        await deposit.save();
+        
+        console.log(`Deposit ${deposit._id} rejected. Reason: ${reason}`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Deposit rejected'
+        });
+    } catch (err) {
+        console.error('Error rejecting deposit:', err);
+        res.status(500).json({ error: 'Failed to reject deposit' });
+    }
+});
+
+// ============================================
+// ADMIN WITHDRAWAL APPROVAL ROUTES
+// ============================================
+
+// Approve Withdrawal
+app.post('/admin/withdrawals/:id/approve', adminAuth, async (req, res) => {
+    try {
+        const withdrawal = await Withdraw.findById(req.params.id).populate('userId');
+        
+        if (!withdrawal) {
+            return res.status(404).json({ error: 'Withdrawal not found' });
+        }
+        
+        if (withdrawal.status !== 'pending') {
+            return res.status(400).json({ error: 'Withdrawal already processed' });
+        }
+        
+        // Update withdrawal status
+        withdrawal.status = 'completed';
+        withdrawal.processedAt = new Date();
+        await withdrawal.save();
+        
+        console.log(`Withdrawal ${withdrawal._id} approved for user ${withdrawal.userId.mobile}, amount: ₹${withdrawal.amount}`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Withdrawal approved - Please process payment manually'
+        });
+    } catch (err) {
+        console.error('Error approving withdrawal:', err);
+        res.status(500).json({ error: 'Failed to approve withdrawal' });
+    }
+});
+
+// Reject Withdrawal
+app.post('/admin/withdrawals/:id/reject', adminAuth, async (req, res) => {
+    try {
+        const { reason } = req.body;
+        const withdrawal = await Withdraw.findById(req.params.id).populate('userId');
+        
+        if (!withdrawal) {
+            return res.status(404).json({ error: 'Withdrawal not found' });
+        }
+        
+        if (withdrawal.status !== 'pending') {
+            return res.status(400).json({ error: 'Withdrawal already processed' });
+        }
+        
+        // Refund amount to user wallet
+        const user = await User.findById(withdrawal.userId);
+        user.updateWallet(withdrawal.amount);
+        await user.save();
+        
+        // Update withdrawal status
+        withdrawal.status = 'failed';
+        withdrawal.failureReason = reason || 'Rejected by admin';
+        withdrawal.processedAt = new Date();
+        await withdrawal.save();
+        
+        console.log(`Withdrawal ${withdrawal._id} rejected and refunded. Reason: ${reason}`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Withdrawal rejected and amount refunded to wallet',
+            refundedAmount: withdrawal.amount,
+            newBalance: user.wallet
+        });
+    } catch (err) {
+        console.error('Error rejecting withdrawal:', err);
+        res.status(500).json({ error: 'Failed to reject withdrawal' });
+    }
+});
+
+// Get Pending Deposits Count (for dashboard)
+app.get('/admin/deposits/pending/count', adminAuth, async (req, res) => {
+    try {
+        const count = await Deposit.countDocuments({ status: 'pending' });
+        res.json({ count });
+    } catch (err) {
+        console.error('Error counting pending deposits:', err);
+        res.status(500).json({ error: 'Failed to count pending deposits' });
+    }
+});
+
+// Get Pending Withdrawals Count (for dashboard)
+app.get('/admin/withdrawals/pending/count', adminAuth, async (req, res) => {
+    try {
+        const count = await Withdraw.countDocuments({ status: 'pending' });
+        res.json({ count });
+    } catch (err) {
+        console.error('Error counting pending withdrawals:', err);
+        res.status(500).json({ error: 'Failed to count pending withdrawals' });
+    }
+});
+
+/* ============================================================
+   END OF APPROVAL ROUTES
+============================================================ */
+/* ============================================================
    TOURNAMENT SYSTEM API ROUTES
    Add these routes to your server.js file
    
