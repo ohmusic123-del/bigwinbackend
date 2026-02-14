@@ -228,14 +228,25 @@ app.get('/monitor/round-stats', authenticateMonitor, async (req, res) => {
 // Get All Monitor Users (Admin Only)
 app.get('/admin/monitor-users', adminAuth, async (req, res) => {
     try {
-        console.log('Fetching monitor users for admin:', req.admin.username);
+        console.log('Fetching monitor users for admin:', req.admin?.username);
         
         const monitors = await MonitorUser.find()
-            .select('-password')
-            .sort({ createdAt: -1 });
+            .select('-password -__v')
+            .sort({ createdAt: -1 })
+            .lean();
 
         console.log('Found', monitors.length, 'monitor users');
-        res.json(monitors);
+        
+        // Clean up data to ensure mobile and reason exist
+        const cleanedMonitors = monitors.map(m => ({
+            _id: m._id,
+            mobile: m.mobile || m.userMobile || m.phone || 'Unknown',
+            reason: m.reason || m.description || 'No reason provided',
+            enabled: m.enabled !== false,
+            createdAt: m.createdAt || new Date()
+        }));
+        
+        res.json(cleanedMonitors);
     } catch (err) {
         console.error('Get monitors error:', err);
         res.status(500).json({ error: 'Failed to fetch monitor users: ' + err.message });
@@ -1593,7 +1604,40 @@ app.get('/withdraw/method', auth, async (req, res) => {
     res.status(500).json({ message: 'Error fetching withdrawal method' });
   }
 });
+// Get withdrawal page data
+app.get("/withdraw", auth, async (req, res) => {
+  try {
+    const user = await User.findOne({ mobile: req.user.mobile });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
 
+    // Get withdrawal method
+    const withdrawMethod = await WithdrawMethod.findOne({ userId: user._id });
+
+    // Get pending withdrawals
+    const pendingWithdrawals = await Withdraw.find({
+      userId: user._id,
+      status: 'pending'
+    });
+
+    res.json({
+      success: true,
+      balance: user.wallet || 0,
+      withdrawMethod: withdrawMethod ? {
+        upiId: withdrawMethod.upiId,
+        accountNumber: withdrawMethod.accountNumber,
+        ifscCode: withdrawMethod.ifscCode,
+        accountHolderName: withdrawMethod.accountHolderName
+      } : null,
+      pendingCount: pendingWithdrawals.length,
+      minWithdraw: 100
+    });
+  } catch (err) {
+    console.error("Withdraw page error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 /* =========================
 WALLET HISTORY
 ========================= */
@@ -1781,16 +1825,20 @@ app.get("/admin/users", adminAuth, async (req, res) => {
 
 app.get("/admin/deposits", adminAuth, async (req, res) => {
   try {
-    const deposits = await Deposit.find()
+    const { status } = req.query;
+    const query = status ? { status } : {};
+    
+    const deposits = await Deposit.find(query)
+      .populate('userId', 'mobile userCode')  // ← ADD THIS
       .sort({ createdAt: -1 })
       .limit(100);
+    
     res.json(deposits);
   } catch (err) {
     console.error("Admin deposits error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 app.post("/admin/deposit/:id", adminAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1845,9 +1893,14 @@ await user.save();
 
 app.get("/admin/withdraws", adminAuth, async (req, res) => {
   try {
-    const withdrawals = await Withdraw.find()
+    const { status } = req.query;
+    const query = status ? { status } : {};
+    
+    const withdrawals = await Withdraw.find(query)
+      .populate('userId', 'mobile userCode')  // ← ADD THIS
       .sort({ createdAt: -1 })
       .limit(100);
+    
     res.json(withdrawals);
   } catch (err) {
     console.error("Admin withdraws error:", err);
@@ -2848,7 +2901,7 @@ app.get('/admin/withdrawals/pending/count', adminAuth, async (req, res) => {
 /* ============================================================
    END OF APPROVAL ROUTES
 ============================================================ */
-/* ============================================================
+
    TOURNAMENT SYSTEM API ROUTES
    Add these routes to your server.js file
    
@@ -2856,7 +2909,6 @@ app.get('/admin/withdrawals/pending/count', adminAuth, async (req, res) => {
    const Tournament = require("./models/Tournament");
    const TournamentParticipant = require("./models/TournamentParticipant");
    const TournamentMatch = require("./models/TournamentMatch");
-============================================================ */
 
 // ============================================
 // PUBLIC TOURNAMENT ROUTES
@@ -2884,30 +2936,33 @@ app.get('/tournaments', async (req, res) => {
 });
 
 // Get single tournament details
+// Get single tournament by ID
 app.get('/tournaments/:id', async (req, res) => {
     try {
-        const tournament = await Tournament.findById(req.params.id)
-            .select('-adminNotes -roomPassword');
+        const tournament = await Tournament.findById(req.params.id);
         
         if (!tournament) {
             return res.status(404).json({ error: 'Tournament not found' });
         }
-        
+
         // Get participant count
         const participantCount = await TournamentParticipant.countDocuments({
             tournamentId: tournament._id,
             status: { $ne: 'disqualified' }
         });
-        
-        tournament.currentParticipants = participantCount;
-        
-        res.json({ tournament });
+
+        const tournamentData = tournament.toObject();
+        tournamentData.currentParticipants = participantCount;
+
+        res.json({ 
+            success: true,
+            tournament: tournamentData 
+        });
     } catch (err) {
         console.error('Error fetching tournament:', err);
         res.status(500).json({ error: 'Failed to fetch tournament' });
     }
 });
-
 // Get tournament participants/leaderboard
 app.get('/tournaments/:id/participants', async (req, res) => {
     try {
@@ -2933,116 +2988,112 @@ app.get('/tournaments/:id/participants', async (req, res) => {
 // Register for tournament
 app.post('/tournaments/:id/register', auth, async (req, res) => {
     try {
-        const userId = req.user.userId;
+        const { teamName, inGameName, inGameId, paymentSource } = req.body;
         const tournamentId = req.params.id;
-        const { teamName, inGameName, inGameId, teamMembers, useBonus } = req.body;
         
-        // Validate input
-        if (!teamName || !inGameName || !inGameId) {
-            return res.status(400).json({ error: 'Team name, in-game name, and in-game ID are required' });
+        console.log('Registration attempt:', {
+            mobile: req.user.mobile,
+            tournamentId,
+            teamName,
+            inGameName,
+            inGameId
+        });
+
+        // Get user - CRITICAL FIX
+        const user = await User.findOne({ mobile: req.user.mobile });
+        if (!user) {
+            console.error('❌ User not found:', req.user.mobile);
+            return res.status(404).json({ error: 'User not found' });
         }
-        
+
         // Get tournament
         const tournament = await Tournament.findById(tournamentId);
         if (!tournament) {
             return res.status(404).json({ error: 'Tournament not found' });
         }
-        
-        // Check if registration is open
-        if (!tournament.isRegistrationOpen()) {
-            return res.status(400).json({ error: 'Tournament registration is closed' });
+
+        // Check tournament status
+        if (tournament.status !== 'registration_open') {
+            return res.status(400).json({ error: 'Registration is closed' });
         }
-        
-        // Check user's existing registrations
-        const userRegistrations = await TournamentParticipant.countDocuments({
-            tournamentId,
-            userId,
+
+        // Check if already registered
+        const existingRegistration = await TournamentParticipant.findOne({
+            tournamentId: tournament._id,
+            userId: user._id
+        });
+
+        if (existingRegistration) {
+            return res.status(400).json({ error: 'Already registered for this tournament' });
+        }
+
+        // Check if slots available
+        const currentParticipants = await TournamentParticipant.countDocuments({
+            tournamentId: tournament._id,
             status: { $ne: 'disqualified' }
         });
-        
-        if (!tournament.canUserRegister(userRegistrations)) {
-            return res.status(400).json({ 
-                error: `You can only register ${tournament.maxParticipantsPerUser} time(s) for this tournament` 
-            });
+
+        if (currentParticipants >= tournament.totalSlots) {
+            return res.status(400).json({ error: 'Tournament is full' });
         }
+
+        // Check if user has enough balance
+        const entryFee = tournament.entryFee || 0;
+        const useBonus = paymentSource === 'bonus';
         
-        // Get user
-        const user = await User.findById(userId);
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
-        if (user.banned) {
-            return res.status(403).json({ error: 'Your account is banned' });
-        }
-        
-        // Check balance
-        const balance = useBonus ? user.bonus : user.wallet;
-        if (balance < tournament.entryFee) {
-            return res.status(400).json({ 
-                error: `Insufficient ${useBonus ? 'bonus' : 'wallet'} balance. Required: ₹${tournament.entryFee}` 
-            });
-        }
-        
-        // Get next slot number
-        const maxSlot = await TournamentParticipant.findOne({ tournamentId })
-            .sort({ slotNumber: -1 })
-            .select('slotNumber');
-        const slotNumber = maxSlot ? maxSlot.slotNumber + 1 : 1;
-        
-        // Create participant
-        const participant = new TournamentParticipant({
-            tournamentId,
-            userId,
-            teamName,
-            inGameName,
-            inGameId,
-            teamMembers: teamMembers || [],
-            entryFeePaid: tournament.entryFee,
-            paidFrom: useBonus ? 'bonus' : 'wallet',
-            slotNumber,
-            status: 'registered'
-        });
-        
-        await participant.save();
-        
-        // Deduct entry fee
         if (useBonus) {
-            user.updateBonus(-tournament.entryFee);
+            if (user.bonus < entryFee) {
+                return res.status(400).json({ error: 'Insufficient bonus balance' });
+            }
         } else {
-            user.updateWallet(-tournament.entryFee);
+            if (user.wallet < entryFee) {
+                return res.status(400).json({ error: 'Insufficient wallet balance' });
+            }
         }
-        await user.save();
-        
-        // Update tournament
-        tournament.currentParticipants += 1;
-        tournament.totalRevenue += tournament.entryFee;
-        
-        if (tournament.currentParticipants >= tournament.totalSlots) {
-            tournament.status = 'registration_closed';
+
+        // Deduct entry fee
+        if (entryFee > 0) {
+            if (useBonus) {
+                user.bonus -= entryFee;
+            } else {
+                user.wallet -= entryFee;
+            }
+            await user.save();
         }
-        
-        await tournament.save();
-        
-        res.json({ 
-            success: true, 
-            message: 'Successfully registered for tournament',
-            participant,
-            slotNumber,
-            balance: useBonus ? user.bonus : user.wallet
+
+        // Create registration
+        const participant = new TournamentParticipant({
+            tournamentId: tournament._id,
+            userId: user._id,
+            teamName: teamName || user.userCode || 'Team',
+            inGameName: inGameName,
+            inGameId: inGameId,
+            slotNumber: currentParticipants + 1,
+            status: 'registered',
+            entryFeePaid: entryFee,
+            paymentSource: useBonus ? 'bonus' : 'wallet',
+            registeredAt: new Date()
         });
-        
+
+        await participant.save();
+
+        console.log('✅ Registration successful:', participant._id);
+
+        res.json({
+            success: true,
+            message: 'Registration successful',
+            participant: {
+                id: participant._id,
+                slotNumber: participant.slotNumber,
+                teamName: participant.teamName
+            }
+        });
+
     } catch (err) {
-        console.error('Error registering for tournament:', err);
-        
-        if (err.code === 11000) {
-            return res.status(400).json({ error: 'You are already registered with this team name' });
-        }
-        
-        res.status(500).json({ error: 'Failed to register for tournament' });
+        console.error('❌ Tournament registration error:', err);
+        res.status(500).json({ error: 'Registration failed: ' + err.message });
     }
 });
-
 // Get user's tournament registrations
 app.get('/my-tournaments', auth, async (req, res) => {
     try {
@@ -3457,9 +3508,7 @@ app.get('/admin/tournaments/:id/stats', adminAuth, async (req, res) => {
     }
 });
 
-/* ============================================================
-   END OF TOURNAMENT ROUTES
-============================================================ */
+
 /* =========================
 SERVER START
 ========================= */
