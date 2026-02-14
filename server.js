@@ -2902,10 +2902,7 @@ app.get('/admin/withdrawals/pending/count', adminAuth, async (req, res) => {
    END OF APPROVAL ROUTES
 ============================================================ */
 
-   TOURNAMENT SYSTEM API ROUTES
-   Add these routes to your server.js file
-   
-   Make sure to also add at the top of server.js:
+
    const Tournament = require("./models/Tournament");
    const TournamentParticipant = require("./models/TournamentParticipant");
    const TournamentMatch = require("./models/TournamentMatch");
