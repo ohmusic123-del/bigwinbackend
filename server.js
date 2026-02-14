@@ -2901,12 +2901,6 @@ app.get('/admin/withdrawals/pending/count', adminAuth, async (req, res) => {
 /* ============================================================
    END OF APPROVAL ROUTES
 ============================================================ */
-
-
-   const Tournament = require("./models/Tournament");
-   const TournamentParticipant = require("./models/TournamentParticipant");
-   const TournamentMatch = require("./models/TournamentMatch");
-
 // ============================================
 // PUBLIC TOURNAMENT ROUTES
 // ============================================
